@@ -31,7 +31,7 @@ app = FastAPI(
         "登记/更正/撤回连续号段；按批核对四类最大连续段，按帧追查两侧清单。"
         "全程以号段为单位存储与计算，不逐帧展开。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -165,6 +165,15 @@ def register_manifest(payload: ManifestIn, conn=Depends(get_conn)):
             payload.seg_start,
             payload.seg_end,
         )
+        # 帧索引与清单同事务写入，失败一并回滚
+        db.index_active_manifest(
+            conn,
+            payload.manifest_no,
+            payload.batch_id,
+            payload.side,
+            payload.seg_start,
+            payload.seg_end,
+        )
         # 只刷新该号段所在的局部区间
         db.refresh_region(
             conn, payload.batch_id, payload.side, payload.seg_start, payload.seg_end
@@ -188,6 +197,15 @@ def correct_manifest(manifest_no: str, payload: CorrectionIn, conn=Depends(get_c
             [(row["seg_start"], row["seg_end"]), (payload.seg_start, payload.seg_end)]
         )
         db.update_manifest_segment(conn, manifest_no, payload.seg_start, payload.seg_end)
+        # 索引项随号段更正一起替换（旧节点删、新节点写），同事务生效
+        db.index_active_manifest(
+            conn,
+            manifest_no,
+            row["batch_id"],
+            row["side"],
+            payload.seg_start,
+            payload.seg_end,
+        )
         # 受影响区间可能是多段（新旧不相邻），逐段局部重建
         for start, end in affected:
             db.refresh_region(conn, row["batch_id"], row["side"], start, end)
@@ -205,6 +223,8 @@ def withdraw_manifest(payload: WithdrawIn, conn=Depends(get_conn)):
         if row["status"] == "withdrawn":
             raise HTTPException(409, f"清单已撤回: {payload.manifest_no}")
         db.mark_manifest_withdrawn(conn, payload.manifest_no)
+        # 撤回清单的索引项同事务移除；同侧其他清单的索引项不受影响
+        db.remove_manifest_index(conn, payload.manifest_no)
         # 仅在原号段区间内重算覆盖
         db.refresh_region(
             conn, row["batch_id"], row["side"], row["seg_start"], row["seg_end"]

@@ -113,6 +113,83 @@ def test_trace_frame(client):
     assert r.status_code == 422
 
 
+def test_trace_counts_boundary_frames(client):
+    _batch(client, "B1", 1, 100)
+    _manifest(client, "C1", "B1", "collector", 1, 100)
+    _manifest(client, "L1", "B1", "library", 1, 100)
+    for frame in (1, 100):
+        r = client.get(f"/batches/B1/frames/{frame}").json()
+        assert r["status"] == "both_present"
+        assert [m["manifest_no"] for m in r["collector_manifests"]] == ["C1"]
+        assert [m["manifest_no"] for m in r["library_manifests"]] == ["L1"]
+
+
+def test_trace_after_partial_withdraw_keeps_remaining_sources(client):
+    _batch(client)
+    _manifest(client, "C1", "B1", "collector", 1, 50)
+    _manifest(client, "C2", "B1", "collector", 30, 100)
+    _manifest(client, "L1", "B1", "library", 1, 100)
+
+    assert client.post("/manifests/withdraw", json={"manifest_no": "C1"}).status_code == 200
+    r = client.get("/batches/B1/frames/40").json()
+    assert r["status"] == "both_present"
+    assert [m["manifest_no"] for m in r["collector_manifests"]] == ["C2"]
+    assert [m["manifest_no"] for m in r["library_manifests"]] == ["L1"]
+
+    # 1-29 同侧已无有效清单
+    r = client.get("/batches/B1/frames/10").json()
+    assert r["status"] == "only_library"
+    assert r["collector_manifests"] == []
+
+
+def test_trace_after_correction_reflects_new_and_old_segment(client):
+    _batch(client)
+    _manifest(client, "C1", "B1", "collector", 10, 20)
+    _manifest(client, "L1", "B1", "library", 1, 100)
+    assert client.put("/manifests/C1", json={"seg_start": 25, "seg_end": 35}).status_code == 200
+
+    r = client.get("/batches/B1/frames/15").json()
+    assert r["status"] == "only_library"
+    assert r["collector_manifests"] == []
+
+    r = client.get("/batches/B1/frames/30").json()
+    assert r["status"] == "both_present"
+    assert [m["manifest_no"] for m in r["collector_manifests"]] == ["C1"]
+    # 返回格式仍带清单自身的完整号段
+    assert r["collector_manifests"][0]["seg_start"] == 25
+    assert r["collector_manifests"][0]["seg_end"] == 35
+
+
+def test_trace_ignores_unrelated_manifests(client):
+    _batch(client, "B1", 1, 10_000)
+    _manifest(client, "HIT", "B1", "collector", 5000, 5000)
+    for i in range(300):
+        _manifest(client, f"N{i}", "B1", "collector", 1 + i * 2, 1 + i * 2)
+        _manifest(client, f"M{i}", "B1", "library", 2 + i * 2, 2 + i * 2)
+
+    r = client.get("/batches/B1/frames/5000").json()
+    assert r["status"] == "only_collector"
+    assert [m["manifest_no"] for m in r["collector_manifests"]] == ["HIT"]
+    assert r["library_manifests"] == []
+
+
+def test_trace_wide_segments_and_big_frames(client):
+    lo, hi = -(2**40), 2**40
+    _batch(client, "W", lo, hi)
+    _manifest(client, "C1", "W", "collector", lo, hi)
+    _manifest(client, "L1", "W", "library", 0, 1)
+    for frame in (0, 1):
+        r = client.get(f"/batches/W/frames/{frame}").json()
+        assert r["status"] == "both_present"
+        assert [m["manifest_no"] for m in r["collector_manifests"]] == ["C1"]
+        assert [m["manifest_no"] for m in r["library_manifests"]] == ["L1"]
+    for frame in (lo, hi, -1, 2):
+        r = client.get(f"/batches/W/frames/{frame}").json()
+        assert r["status"] == "only_collector"
+        assert [m["manifest_no"] for m in r["collector_manifests"]] == ["C1"]
+        assert r["library_manifests"] == []
+
+
 def test_out_of_range_rejected_and_state_unchanged(client):
     _batch(client)
     # 登记越界

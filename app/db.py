@@ -1,11 +1,18 @@
-"""SQLite 存取层：批次、清单号段与增量维护的覆盖段。
+"""SQLite 存取层：批次、清单号段、增量覆盖段与按帧追查索引。
 
 设计要点：
-- 帧号以 64 位整数存储（可跨十亿），存储单位是号段而不是帧。
+- 帧号以 64 位有符号整数存储（可跨十亿），存储单位是号段而不是帧。
 - ``coverage`` 表缓存每侧已合并的覆盖段，登记/更正/撤回清单时
   只对受影响区间做局部重算，不重扫整批清单。
-- 所有写操作在单个事务（BEGIN IMMEDIATE）内完成，越界或入库失败
-  自动回滚，清单与覆盖段（核对结果）同时生效。
+- ``frame_index`` 是号段到帧的倒排索引：用覆盖整个 int64 域（65 层）的
+  区段树做规范分解，把一张清单的号段拆成至多 128 个树节点（每张清单
+  固定上限），按 ``(batch_id, node_key)`` 建立主键。查一帧只需沿树根到
+  叶的 65 个节点键做点查，命中的索引项全部覆盖该帧，读量只随命中清单
+  数增长；长号段按号段分解，绝不逐帧展开。
+- 所有写操作在单个事务（BEGIN IMMEDIATE）内完成：清单、覆盖段、帧索引
+  同时生效；越界、入库或索引写入失败自动回滚，保留调用前原状。
+- 旧库升级：``init_db`` 通过 ``PRAGMA user_version`` 检测并从 ``manifests``
+  回填索引，升级后原有清单可直接按帧追查。
 """
 
 from __future__ import annotations
@@ -22,6 +29,14 @@ DEFAULT_DB_PATH = os.environ.get(
 )
 
 VALID_SIDES = ("collector", "library")
+
+# 帧号仍支持有符号 64 位整数；索引树覆盖整个 int64 域。
+INT64_MIN = -(2**63)
+INT64_MAX = 2**63 - 1
+DOMAIN_SIZE_BITS = 64
+DOMAIN_LEVELS = DOMAIN_SIZE_BITS + 1  # 第 0 层为根，第 64 层为单帧叶子
+
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -56,7 +71,70 @@ CREATE TABLE IF NOT EXISTS coverage (
 );
 CREATE INDEX IF NOT EXISTS idx_coverage_lookup
     ON coverage (batch_id, side, seg_start, seg_end);
+
+-- 帧号倒排索引：每张有效清单的号段分解为至多 128 个树节点。
+-- 主键顺序让单次查帧能用 (batch_id, node_key) 做点查，两侧一并取回。
+CREATE TABLE IF NOT EXISTS frame_index (
+    batch_id    TEXT NOT NULL,
+    node_key    BLOB NOT NULL,
+    side        TEXT NOT NULL CHECK (side IN ('collector', 'library')),
+    manifest_no TEXT NOT NULL REFERENCES manifests(manifest_no),
+    PRIMARY KEY (batch_id, node_key, side, manifest_no)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_frame_index_manifest
+    ON frame_index (manifest_no);
 """
+
+
+# ---------- 区段树节点键 ----------
+
+def _node_key(level: int, index: int) -> bytes:
+    """节点键：1 字节层号 + 8 字节无符号节点序号（第 64 层可达 2^64-1）。
+
+    用 BLOB 而不是 SQLite INTEGER，是因为叶子层序号需要完整的 64 位
+    无符号范围，超出 SQLite 有符号 64 位整数。等值点查可直接走主键。
+    """
+    return level.to_bytes(1, "big") + index.to_bytes(8, "big")
+
+
+def index_keys_for_segment(start: int, end: int) -> List[bytes]:
+    """把闭区间 [start, end] 规范分解为区段树节点键。
+
+    第 0 层覆盖 [INT64_MIN, INT64_MAX]，每层二分；节点完全落在号段内
+    即收入结果。任意 int64 号段至多产生 2 * 64 = 128 个节点，与号段
+    长度无关，长号段不会被逐帧展开。
+    """
+    if start > end:
+        raise ValueError(f"非法号段: ({start}, {end})")
+    if start < INT64_MIN or end > INT64_MAX:
+        raise ValueError(f"号段超出 64 位整数范围: ({start}, {end})")
+
+    keys: List[bytes] = []
+    stack: List[Tuple[int, int, int, int]] = [(0, 0, INT64_MIN, INT64_MAX)]
+    while stack:
+        level, index, lo, hi = stack.pop()
+        if start <= lo and hi <= end:
+            keys.append(_node_key(level, index))
+            continue
+        mid = (lo + hi) // 2
+        # 当前节点必然与 [start, end] 相交，至少一侧存在交集。
+        if start <= mid:
+            stack.append((level + 1, index * 2, lo, mid))
+        if end > mid:
+            stack.append((level + 1, index * 2 + 1, mid + 1, hi))
+    keys.sort()
+    return keys
+
+
+def index_keys_for_frame(frame_no: int) -> List[bytes]:
+    """一帧在 65 层中的节点键：根到叶唯一路径。固定 65 次点查定位。"""
+    if not (INT64_MIN <= frame_no <= INT64_MAX):
+        raise ValueError(f"帧号超出 64 位整数范围: {frame_no}")
+    offset = frame_no - INT64_MIN  # 0 .. 2^64-1
+    return [
+        _node_key(level, offset >> (DOMAIN_SIZE_BITS - level))
+        for level in range(DOMAIN_LEVELS)
+    ]
 
 
 def connect(db_path: Optional[str] = None) -> sqlite3.Connection:
@@ -72,12 +150,58 @@ def connect(db_path: Optional[str] = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: Optional[str] = None) -> None:
+    """建表并升级旧库；旧库中的清单会被回填进帧索引，可直接按帧追查。
+
+    旧库可能由多进程同时首次启动，迁移用 ``BEGIN IMMEDIATE`` 串行化，
+    拿到写锁后再读版本号，避免重复回填或版本被抢先推进。
+    """
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        with transaction(conn):
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version < SCHEMA_VERSION:
+                _rebuild_frame_index(conn)
+                _rebuild_coverage(conn)
+                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         conn.commit()
     finally:
         conn.close()
+
+
+def _rebuild_frame_index(conn: sqlite3.Connection) -> None:
+    """从清单表完整重建帧索引（升级旧库或索引损坏时使用）。"""
+    conn.execute("DELETE FROM frame_index")
+    rows = conn.execute(
+        "SELECT manifest_no, batch_id, side, seg_start, seg_end "
+        "FROM manifests WHERE status='active'"
+    ).fetchall()
+    for row in rows:
+        _add_frame_index(
+            conn, row["manifest_no"], row["batch_id"], row["side"],
+            row["seg_start"], row["seg_end"],
+        )
+
+
+def _rebuild_coverage(conn: sqlite3.Connection) -> None:
+    """升级旧库时由有效清单重建覆盖段，保证核对结果与清单一致。"""
+    conn.execute("DELETE FROM coverage")
+    batches = conn.execute("SELECT batch_id FROM batches").fetchall()
+    for batch in batches:
+        for side in VALID_SIDES:
+            rows = conn.execute(
+                "SELECT seg_start, seg_end FROM manifests "
+                "WHERE batch_id=? AND side=? AND status='active'",
+                (batch["batch_id"], side),
+            ).fetchall()
+            for start, end in intervals.merge(
+                (r["seg_start"], r["seg_end"]) for r in rows
+            ):
+                conn.execute(
+                    "INSERT INTO coverage (batch_id, side, seg_start, seg_end) "
+                    "VALUES (?, ?, ?, ?)",
+                    (batch["batch_id"], side, start, end),
+                )
 
 
 @contextmanager
@@ -156,6 +280,48 @@ def active_manifests_in(
     ).fetchall()
 
 
+# ---------- 帧索引（按帧追查的读路径） ----------
+
+def _add_frame_index(
+    conn: sqlite3.Connection,
+    manifest_no: str,
+    batch_id: str,
+    side: str,
+    start: int,
+    end: int,
+) -> None:
+    conn.executemany(
+        "INSERT OR IGNORE INTO frame_index "
+        "(batch_id, node_key, side, manifest_no) VALUES (?, ?, ?, ?)",
+        [
+            (batch_id, key, side, manifest_no)
+            for key in index_keys_for_segment(start, end)
+        ],
+    )
+
+
+def _remove_frame_index(conn: sqlite3.Connection, manifest_no: str) -> None:
+    conn.execute("DELETE FROM frame_index WHERE manifest_no=?", (manifest_no,))
+
+
+def index_active_manifest(
+    conn: sqlite3.Connection,
+    manifest_no: str,
+    batch_id: str,
+    side: str,
+    start: int,
+    end: int,
+) -> None:
+    """清单有效（登记或更正）时维护其索引项，与清单同事务生效。"""
+    _remove_frame_index(conn, manifest_no)
+    _add_frame_index(conn, manifest_no, batch_id, side, start, end)
+
+
+def remove_manifest_index(conn: sqlite3.Connection, manifest_no: str) -> None:
+    """清单撤回时移除索引项，与状态变更同事务生效。"""
+    _remove_frame_index(conn, manifest_no)
+
+
 # ---------- 覆盖段（核对结果缓存，增量维护） ----------
 
 def coverage_segments(
@@ -178,6 +344,9 @@ def refresh_region(
     被吸收，重新合并成最大连续段。
     """
     lo, hi = region_start - 1, region_end + 1
+    # 号段可在 int64 边界上，外扩时钳制，避免绑定超出 SQLite 整数范围
+    lo = max(lo, INT64_MIN)
+    hi = min(hi, INT64_MAX)
 
     old_rows = conn.execute(
         "SELECT seg_start, seg_end FROM coverage "
@@ -242,28 +411,61 @@ def reconcile(
 
 
 def trace_frame(conn: sqlite3.Connection, batch_id: str, frame_no: int) -> dict:
-    batch = get_batch(conn, batch_id)
-    if batch is None:
+    """按帧追查两侧覆盖该帧的有效清单。
+
+    读路径只走帧索引：沿树根到叶的 65 个节点键做点查，每个键下的索引项
+    都必然覆盖该帧（节点完全落在清单号段内），因此读取的索引项只随命中
+    清单数增长，与批次大小、清单总数无关。批次范围与两侧清单由同一条
+    SQL 语句取回，状态判定与清单列表来自同一份已提交快照。
+    """
+    if not (INT64_MIN <= frame_no <= INT64_MAX):
+        raise ValueError(f"帧号超出 64 位整数范围: {frame_no}")
+
+    keys = index_keys_for_frame(frame_no)
+    placeholders = ",".join("?" for _ in keys)
+    # 一条语句同时取回批次范围与两侧命中清单，SQLite 的语句级读快照保证
+    # 状态判定与清单列表来自同一份已提交数据，写入不会在两次读取之间混入。
+    rows = conn.execute(
+        "SELECT b.frame_start AS b_start, b.frame_end AS b_end, "
+        "       fi.side AS side, m.manifest_no AS manifest_no, "
+        "       m.seg_start AS seg_start, m.seg_end AS seg_end "
+        "FROM batches b "
+        "LEFT JOIN frame_index fi "
+        "  ON fi.batch_id = b.batch_id "
+        f" AND fi.node_key IN ({placeholders}) "
+        "LEFT JOIN manifests m "
+        "  ON m.manifest_no = fi.manifest_no AND m.status = 'active' "
+        "WHERE b.batch_id = ? "
+        "ORDER BY fi.side, m.seg_start, m.manifest_no",
+        (*keys, batch_id),
+    ).fetchall()
+    if not rows:
         raise LookupError(f"批次不存在: {batch_id}")
-    if not (batch["frame_start"] <= frame_no <= batch["frame_end"]):
+
+    b_start, b_end = rows[0]["b_start"], rows[0]["b_end"]
+    if not (b_start <= frame_no <= b_end):
         raise ValueError(
-            f"帧号 {frame_no} 越界，批次范围为 "
-            f"[{batch['frame_start']}, {batch['frame_end']}]"
+            f"帧号 {frame_no} 越界，批次范围为 [{b_start}, {b_end}]"
         )
 
-    def manifests_of(side):
-        rows = active_manifests_in(conn, batch_id, side, frame_no, frame_no)
-        return [
+    by_side = {"collector": [], "library": []}
+    seen = set()
+    for r in rows:
+        manifest_no = r["manifest_no"]
+        # LEFT JOIN 无命中时清单列为 NULL；索引项必然覆盖该帧，无需回表再判
+        if manifest_no is None or manifest_no in seen:
+            continue
+        seen.add(manifest_no)
+        by_side[r["side"]].append(
             {
-                "manifest_no": r["manifest_no"],
+                "manifest_no": manifest_no,
                 "seg_start": r["seg_start"],
                 "seg_end": r["seg_end"],
             }
-            for r in rows
-        ]
+        )
+    collector_manifests = by_side["collector"]
+    library_manifests = by_side["library"]
 
-    collector_manifests = manifests_of("collector")
-    library_manifests = manifests_of("library")
     in_collector = bool(collector_manifests)
     in_library = bool(library_manifests)
     if in_collector and in_library:
